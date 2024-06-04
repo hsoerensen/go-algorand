@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/algorand/go-algorand/config"
 	"github.com/algorand/go-algorand/logging"
@@ -42,8 +43,10 @@ const minLenBlockStr = 6 // the minimum size of a block filename (after padding 
 var downloadFlag = flag.Bool("download", false, "Download blocks from an origin server")
 var serversFlag = flag.String("servers", "", "Semicolon-separated list of origin server addresses (host:port)")
 var networkFlag = flag.String("network", "", "Network ID to obtain servers via DNS SRV")
+var archiveDNSFlag = flag.Bool("archive-only", false, "Use archive DNS SRV records only")
 var genesisFlag = flag.String("genesis", "", "Genesis ID")
 var connsFlag = flag.Int("conns", 2, "Number of connections per server")
+var firstBlockFlag = flag.Uint64("first-block", 0, "First block to download")
 
 var serverList []string
 var nextBlk uint64
@@ -110,7 +113,11 @@ func blockFullPath(blk uint64) string {
 }
 
 func blockURL(server string, blk uint64) string {
-	return fmt.Sprintf("http://%s/v1/%s/block/%s", server, *genesisFlag, blockToString(blk))
+	log := logging.Base()
+
+	var blockURL = fmt.Sprintf("http://%s/v1/%s/block/%s", server, *genesisFlag, blockToString(blk))
+	log.Debugf("blockURL: %s", blockURL)
+	return blockURL
 }
 
 func fetchBlock(server string, blk uint64) error {
@@ -159,13 +166,22 @@ func fetchBlock(server string, blk uint64) error {
 	return os.WriteFile(fn, body, 0666)
 }
 
-func fetcher(server string, wg *sync.WaitGroup) {
+func fetcher(server string, wg *sync.WaitGroup, maxRetries int) {
 	log := logging.Base()
 
 	for {
 		myBlock := atomic.AddUint64(&nextBlk, 1) - 1
 
-		err := fetchBlock(server, myBlock)
+		var err error
+		for i := 0; i < maxRetries; i++ {
+			err = fetchBlock(server, myBlock)
+			if err == nil {
+				break
+			}
+			log.Errorf("fetching %d (%s) from %s: %v (attempt: %d)", myBlock, blockToFileName(myBlock), server, err, i+1)
+			time.Sleep(1 * time.Second)
+		}
+
 		if err != nil {
 			log.Errorf("fetching %d (%s) from %s: %v", myBlock, blockToFileName(myBlock), server, err)
 			break
@@ -177,6 +193,8 @@ func fetcher(server string, wg *sync.WaitGroup) {
 
 // TODO: We may want to implement conditional fallback to backup bootstrap logic here
 func download() {
+	maxRetries := 3
+
 	if *genesisFlag == "" {
 		panic("Must specify -genesis")
 	}
@@ -184,10 +202,25 @@ func download() {
 	if *serversFlag != "" {
 		serverList = strings.Split(*serversFlag, ";")
 	} else if *networkFlag != "" {
-		cfg := config.GetDefaultLocal()
+		cfg, err := config.LoadConfigFromDisk(*dirFlag)
+		if err != nil {
+			panic("Configuration could not be loaded")
+		}
+
+		maxRetries = cfg.CatchupBlockDownloadRetryAttempts
+
 		// only using first dnsBootstrap entry (if more than one are configured) and just the primary SRV, not backup
 		dnsBootstrap := cfg.DNSBootstrapArray(protocol.NetworkID(*networkFlag))[0]
-		_, records, err := net.LookupSRV("algobootstrap", "tcp", dnsBootstrap.PrimarySRVBootstrap)
+
+		// If archive-only flag is set, use only the archive DNS SRV records
+		var dnsService string
+		if *archiveDNSFlag {
+			dnsService = "archive"
+		} else {
+			dnsService = "algobootstrap"
+		}
+
+		_, records, err := net.LookupSRV(dnsService, "tcp", dnsBootstrap.PrimarySRVBootstrap)
 		if err != nil {
 			dnsAddr, err2 := net.ResolveIPAddr("ip", cfg.FallbackDNSResolverAddress)
 			if err2 != nil {
@@ -197,7 +230,7 @@ func download() {
 
 			var resolver tools_network.Resolver
 			resolver.SetFallbackResolverAddress(*dnsAddr)
-			_, records, err = resolver.LookupSRV(context.Background(), "algobootstrap", "tcp", dnsBootstrap.PrimarySRVBootstrap)
+			_, records, err = resolver.LookupSRV(context.Background(), dnsService, "tcp", dnsBootstrap.PrimarySRVBootstrap)
 			if err != nil {
 				panic(err)
 			}
@@ -208,6 +241,10 @@ func download() {
 		}
 	} else {
 		panic("Must specify -servers or -network")
+	}
+
+	if *firstBlockFlag != 0 {
+		nextBlk = *firstBlockFlag
 	}
 
 	http.DefaultTransport.(*http.Transport).MaxConnsPerHost = *connsFlag
@@ -224,7 +261,7 @@ func download() {
 	for _, srv := range serverList {
 		wg.Add(fetchPerServer)
 		for i := 0; i < fetchPerServer; i++ {
-			go fetcher(srv, &wg)
+			go fetcher(srv, &wg, maxRetries)
 		}
 	}
 
