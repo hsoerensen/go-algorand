@@ -46,7 +46,8 @@ var networkFlag = flag.String("network", "", "Network ID to obtain servers via D
 var archiveDNSFlag = flag.Bool("archive-only", false, "Use archive DNS SRV records only")
 var genesisFlag = flag.String("genesis", "", "Genesis ID")
 var connsFlag = flag.Int("conns", 2, "Number of connections per server")
-var firstBlockFlag = flag.Uint64("first-block", 0, "First block to download")
+var firstBlockFlag = flag.Int("firstblock", 0, "First block to download")
+var lastBlockFlag = flag.Int("lastblock", 0, "Last block to download")
 
 var serverList []string
 var nextBlk uint64
@@ -172,6 +173,10 @@ func fetcher(server string, wg *sync.WaitGroup, maxRetries int) {
 	for {
 		myBlock := atomic.AddUint64(&nextBlk, 1) - 1
 
+		if myBlock > uint64(*lastBlockFlag) && *lastBlockFlag != 0 {
+			break
+		}
+
 		var err error
 		for i := 0; i < maxRetries; i++ {
 			err = fetchBlock(server, myBlock)
@@ -202,10 +207,7 @@ func download() {
 	if *serversFlag != "" {
 		serverList = strings.Split(*serversFlag, ";")
 	} else if *networkFlag != "" {
-		cfg, err := config.LoadConfigFromDisk(*dirFlag)
-		if err != nil {
-			panic("Configuration could not be loaded")
-		}
+		cfg, _ := config.LoadConfigFromDisk(*dirFlag)
 
 		maxRetries = cfg.CatchupBlockDownloadRetryAttempts
 
@@ -244,7 +246,7 @@ func download() {
 	}
 
 	if *firstBlockFlag != 0 {
-		nextBlk = *firstBlockFlag
+		nextBlk = uint64(*firstBlockFlag)
 	}
 
 	http.DefaultTransport.(*http.Transport).MaxConnsPerHost = *connsFlag
